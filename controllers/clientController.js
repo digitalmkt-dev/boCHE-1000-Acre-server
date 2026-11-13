@@ -64,137 +64,171 @@ const submitForm = async (req, res) => {
             Checkout: formattedData.checkout || "",
         };
 
-        // ── Generate unique Enq No with mutex lock ──
-        const release = await enqMutex.acquire();
-        let nextEnqNo;
+        const logToSheet = async () => {
+            // ── Generate unique Enq No with mutex lock ──
+            const release = await enqMutex.acquire();
+            let enqNo;
 
-        try {
-            const counterRes = await sheetsApi.spreadsheets.values.get({
+            try {
+                const counterRes = await sheetsApi.spreadsheets.values.get({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                    range: "Enquiry!K1",
+                });
+
+                const lastNumber = parseInt(counterRes.data.values?.[0]?.[0] || '0', 10);
+                const nextNumber = lastNumber + 1;
+                enqNo = `ENQ-${String(nextNumber).padStart(6, '0')}`;
+
+                await sheetsApi.spreadsheets.values.update({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                    range: "Enquiry!K1",
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [[nextNumber]] }
+                });
+
+            } finally {
+                release();
+            }
+
+            // ── Insert blank row at position 2 ──
+            await sheetsApi.spreadsheets.batchUpdate({
                 spreadsheetId: process.env.GOOGLE_SHEET_ID,
-                range: "Enquiry!K1",
+                requestBody: {
+                    requests: [{
+                        insertDimension: {
+                            range: {
+                                sheetId: 0,
+                                dimension: 'ROWS',
+                                startIndex: 1,
+                                endIndex: 2,
+                            },
+                            inheritFromBefore: false,
+                        }
+                    }]
+                }
             });
 
-            const lastNumber = parseInt(counterRes.data.values?.[0]?.[0] || '0', 10);
-            const nextNumber = lastNumber + 1;
-            nextEnqNo = `ENQ-${String(nextNumber).padStart(6, '0')}`;
-
+            // ── Write data into row 2 ──
             await sheetsApi.spreadsheets.values.update({
                 spreadsheetId: process.env.GOOGLE_SHEET_ID,
-                range: "Enquiry!K1",
+                range: "Enquiry!A2:J2",
                 valueInputOption: 'RAW',
-                requestBody: { values: [[nextNumber]] }
+                requestBody: {
+                    values: [[
+                        enqNo,
+                        finalData.Name,
+                        finalData.Address,
+                        finalData.Email,
+                        finalData.Phone,
+                        finalData.Adults,
+                        finalData.Children,
+                        finalData.Checkin,
+                        finalData.Checkout,
+                        'New',
+                    ]]
+                }
             });
 
-        } finally {
-            release();
-        }
+            return enqNo;
+        };
 
-        // ── Insert blank row at position 2 ──
-        await sheetsApi.spreadsheets.batchUpdate({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            requestBody: {
-                requests: [{
-                    insertDimension: {
-                        range: {
-                            sheetId: 0,
-                            dimension: 'ROWS',
-                            startIndex: 1,
-                            endIndex: 2,
-                        },
-                        inheritFromBefore: false,
-                    }
-                }]
-            }
+        let timeoutId;
+        const timeoutPromise = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+                const err = new Error("Server busy. Please try again later.");
+                err.statusCode = 503;
+                reject(err);
+            }, 15000);
         });
 
-        // ── Write data into row 2 ──
-        await sheetsApi.spreadsheets.values.update({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            range: "Enquiry!A2:J2",
-            valueInputOption: 'RAW',
-            requestBody: {
-                values: [[
-                    nextEnqNo,
-                    finalData.Name,
-                    finalData.Address,
-                    finalData.Email,
-                    finalData.Phone,
-                    finalData.Adults,
-                    finalData.Children,
-                    finalData.Checkin,
-                    finalData.Checkout,
-                    'New',
-                ]]
-            }
-        });
-
+        let nextEnqNo;
         try {
-    // Read all current data from main sheet
-    const mainData = await sheetsApi.spreadsheets.values.get({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: "Enquiry!A1:J",
-    });
-
-    // Write all data to backup sheet
-    await sheetsApi.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_BACKUP_SHEET_ID,
-        range: "Sheet1!A1",
-        valueInputOption: 'RAW',
-        requestBody: {
-            values: mainData.data.values || [],
+            nextEnqNo = await Promise.race([logToSheet(), timeoutPromise]);
+        } finally {
+            clearTimeout(timeoutId);
         }
-    });
 
-    console.log("✅ Backup updated successfully");
-} catch (backupErr) {
-    // Backup failure should NOT affect main form submission
-    console.error("❌ Backup error:", backupErr.message);
-}
-
-        // ── Reset unprotected range back to full column J from row 2 ──
-        await sheetsApi.spreadsheets.batchUpdate({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            requestBody: {
-                requests: [{
-                    updateProtectedRange: {
-                        protectedRange: {
-                            protectedRangeId: 164142777,
-                            range: {},
-                            unprotectedRanges: [{
-                                startRowIndex: 1,     // row 2 (0-indexed)
-                                startColumnIndex: 9,  // column J (0-indexed)
-                                endColumnIndex: 10,
-                                // No endRowIndex = to end of sheet
-                            }],
-                            editors: {
-                                users: [
-                                    "sheets-access@boche-1000-acre.iam.gserviceaccount.com",
-                                    "boche.bhumiputra@gmail.com"
-                                ]
-                            }
-                        },
-                        fields: 'unprotectedRanges',
-                    }
-                }]
-            }
-        });
-
-        // ── Send emails ──
-        if (finalData.Email) {
-            await sendEnquiryConfirmationToClient(finalData.Email, finalData.Name);
-        }
-        await sendEnquiryDetailsToAdmin({ ...finalData, EnqNo: nextEnqNo });
-
+        // ── Respond immediately once data is logged in the main sheet ──
         res.status(200).json({
             success: true,
             message: "Form submitted successfully",
         });
 
+        // ── Run backup, protected-range reset, and emails in the background ──
+        (async () => {
+            try {
+                const mainData = await sheetsApi.spreadsheets.values.get({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                    range: "Enquiry!A1:J",
+                });
+
+                await sheetsApi.spreadsheets.values.update({
+                    spreadsheetId: process.env.GOOGLE_BACKUP_SHEET_ID,
+                    range: "Sheet1!A1",
+                    valueInputOption: 'RAW',
+                    requestBody: {
+                        values: mainData.data.values || [],
+                    }
+                });
+
+                console.log("✅ Backup updated successfully");
+            } catch (backupErr) {
+                console.error("❌ Backup error:", backupErr.message);
+            }
+
+            try {
+                await sheetsApi.spreadsheets.batchUpdate({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                    requestBody: {
+                        requests: [{
+                            updateProtectedRange: {
+                                protectedRange: {
+                                    protectedRangeId: 164142777,
+                                    range: {},
+                                    unprotectedRanges: [{
+                                        startRowIndex: 1,     // row 2 (0-indexed)
+                                        startColumnIndex: 9,  // column J (0-indexed)
+                                        endColumnIndex: 10,
+                                        // No endRowIndex = to end of sheet
+                                    }],
+                                    editors: {
+                                        users: [
+                                            "sheets-access@boche-1000-acre.iam.gserviceaccount.com",
+                                            "boche.bhumiputra@gmail.com"
+                                        ]
+                                    }
+                                },
+                                fields: 'unprotectedRanges',
+                            }
+                        }]
+                    }
+                });
+            } catch (protectErr) {
+                console.error("❌ Protected range update error:", protectErr.message);
+            }
+
+            try {
+                await sendEnquiryDetailsToAdmin({ ...finalData, EnqNo: nextEnqNo });
+            } catch (err) {
+                console.error("❌ Admin enquiry mail failed:", err.message);
+            }
+
+            if (finalData.Email) {
+                try {
+                    await sendEnquiryConfirmationToClient(finalData.Email, finalData.Name);
+                } catch (err) {
+                    console.error("❌ Client confirmation mail failed:", err.message);
+                }
+            }
+        })();
+
     } catch (error) {
         console.error("❌ submitForm error:", error);
-        res.status(500).json({
+        if (res.headersSent) return;
+        const statusCode = error.statusCode || 500;
+        res.status(statusCode).json({
             success: false,
-            message: "Failed to submit form",
+            message: statusCode === 503 ? "Server is busy. Please try again later." : "Failed to submit form",
             error: error.message,
         });
     }
